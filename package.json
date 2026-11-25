@@ -1,6 +1,6 @@
 {
   "name": "rialo",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "ریالو — دستیار شخصی و کاملاً آفلاین مدیریت تراکنش‌های بانکی؛ بسته‌بندی‌شده با Capacitor برای اندروید",
   "private": true,
   "scripts": {

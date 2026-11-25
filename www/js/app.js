@@ -7,7 +7,7 @@ const App = (() => {
   const root = document.getElementById('app-shell');
 
   const APP_NAME = 'ریالو';
-  const APP_VERSION = '1.0.1';
+  const APP_VERSION = '1.1.0';
   const GITHUB_URL = 'https://github.com/xigmadev/rialo';
 
   let STATE = {
@@ -24,7 +24,15 @@ const App = (() => {
   const toFa = (n) => (n === null || n === undefined || isNaN(n)) ? '—' : Number(n).toLocaleString('fa-IR');
   const toman = (rial) => Math.round((rial || 0) / 10);
   const money = (rial) => `${toFa(toman(rial))} <small>تومان</small>`;
-  const escapeHtml = (s) => (s || '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const escapeHtml = (s) => (s === null || s === undefined ? '' : String(s)).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+  // تم در localStorage هم آینه می‌شود تا index.html بتواند پیش از اولین رندر
+  // (و پیش از باز شدن IndexedDB) آن را اعمال کند و چشمک تم روشن دیده نشود.
+  function applyTheme(t) {
+    document.documentElement.dataset.theme = t;
+    try { localStorage.setItem('rialo-theme', t); } catch (_) {}
+    document.querySelector('meta[name="theme-color"]')?.setAttribute('content', t === 'dark' ? '#0A1615' : '#0D3A42');
+  }
 
   function toast(msg) {
     const el = document.createElement('div');
@@ -91,17 +99,33 @@ const App = (() => {
   };
 
   /* ---------------- بارگذاری داده‌های پایه (Cache) ---------------- */
+  // جداول مرجع به‌صورت موازی خوانده می‌شوند (از کش DB) و برای جستجوی O(1) در Map نگه داشته می‌شوند
+  const LOOKUP = { units: new Map(), categories: new Map(), banks: new Map(), accounts: new Map() };
+  const toMap = (rows) => new Map(rows.map((r) => [r.id, r]));
   async function refreshLookups() {
-    STATE.unitsCache = await DB.getAll('units');
-    STATE.categoriesCache = await DB.getAll('categories');
-    STATE.banksCache = await DB.getAll('banks');
-    STATE.accountsCache = await DB.getAll('accounts');
+    const [units, categories, banks, accounts] = await Promise.all([
+      DB.getAll('units'), DB.getAll('categories'), DB.getAll('banks'), DB.getAll('accounts'),
+    ]);
+    STATE.unitsCache = units;
+    STATE.categoriesCache = categories;
+    STATE.banksCache = banks;
+    STATE.accountsCache = accounts;
+    LOOKUP.units = toMap(units);
+    LOOKUP.categories = toMap(categories);
+    LOOKUP.banks = toMap(banks);
+    LOOKUP.accounts = toMap(accounts);
   }
-  const unitName = (id) => STATE.unitsCache.find((u) => u.id === id)?.name || null;
-  const catName = (id) => STATE.categoriesCache.find((c) => c.id === id)?.name || null;
-  const catColor = (id) => STATE.categoriesCache.find((c) => c.id === id)?.color || 'var(--primary)';
-  const bankOf = (id) => STATE.banksCache.find((b) => b.id === id) || null;
-  const accountOf = (id) => STATE.accountsCache.find((a) => a.id === id) || null;
+  const unitName = (id) => LOOKUP.units.get(id)?.name || null;
+  const catName = (id) => LOOKUP.categories.get(id)?.name || null;
+  const catColor = (id) => LOOKUP.categories.get(id)?.color || 'var(--primary)';
+  const bankOf = (id) => LOOKUP.banks.get(id) || null;
+  const accountOf = (id) => LOOKUP.accounts.get(id) || null;
+
+  // مرتب‌سازی جدیدترین‌ها اول؛ createdAt همیشه رشته‌ی ISO است، پس مقایسه‌ی رشته‌ای
+  // درست و بسیار سریع‌تر از ساختن Date در هر مقایسه است.
+  const byNewest = (a, b) => (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : (b.id || 0) - (a.id || 0));
+
+  const signedAmount = (t) => (t.type === 'deposit' ? (t.amount || 0) : t.type === 'withdraw' ? -(t.amount || 0) : 0);
 
   // تلاش برای تطبیق یک پیامک تجزیه‌شده با یکی از حساب‌های ثبت‌شده، بر اساس
   // شماره کارت (۴ رقم آخر) یا شماره حساب. اگر پیامک اصلاً شماره‌ای نداشته باشد
@@ -115,12 +139,22 @@ const App = (() => {
   }
 
   // موجودی فعلی هر حساب = موجودی اولیه + مجموع واریزها − مجموع برداشت‌های ثبت‌شده روی همان حساب
+  // دلتای همه‌ی حساب‌ها در «یک» پیمایش محاسبه و به‌ازای همان آرایه memoize می‌شود
+  // (نسخه‌ی قبلی برای هر حساب کل تراکنش‌ها را فیلتر می‌کرد: O(حساب × تراکنش)).
+  const balanceMemo = new WeakMap();
   function accountBalance(accountId, allTx) {
     const acc = accountOf(accountId);
     if (!acc) return 0;
-    const related = allTx.filter((t) => t.accountId === accountId);
-    const delta = related.reduce((s, t) => s + (t.type === 'deposit' ? (t.amount || 0) : t.type === 'withdraw' ? -(t.amount || 0) : 0), 0);
-    return (acc.initialBalance || 0) + delta;
+    let deltas = balanceMemo.get(allTx);
+    if (!deltas) {
+      deltas = new Map();
+      for (const t of allTx) {
+        if (t.accountId == null) continue;
+        deltas.set(t.accountId, (deltas.get(t.accountId) || 0) + signedAmount(t));
+      }
+      balanceMemo.set(allTx, deltas);
+    }
+    return (acc.initialBalance || 0) + (deltas.get(accountId) || 0);
   }
 
   /* ---------------- محاسبه بازه زمانی ---------------- */
@@ -136,12 +170,10 @@ const App = (() => {
   }
 
   /* برای سادگی، چون تاریخ تراکنش‌ها به فرمت متنی پیامک (شمسی خام) است،
-     در نبود تاریخ معتبر از createdAt (تاریخ ثبت در برنامه) استفاده می‌شود. */
-  function inPeriod(t, period) {
-    if (period === 'all') return true;
-    const { from } = periodRange(period);
-    const d = new Date(t.createdAt);
-    return d >= from;
+     در نبود تاریخ معتبر از createdAt (تاریخ ثبت در برنامه) استفاده می‌شود.
+     مرز بازه یک‌بار به رشته‌ی ISO تبدیل می‌شود تا مقایسه بدون ساخت Date انجام شود. */
+  function periodFromIso(period) {
+    return period === 'all' ? '' : periodRange(period).from.toISOString();
   }
 
   /* ---------------- روتر ---------------- */
@@ -157,9 +189,16 @@ const App = (() => {
     '/backup': renderBackup,
   };
 
+  let routeSeq = 0;
   async function router() {
-    let hash = location.hash.replace('#', '') || '/dashboard';
+    const seq = ++routeSeq;
+    const hash = location.hash.replace('#', '') || '/dashboard';
+    // شیت باز یا نوار انتخاب گروهی صفحه‌ی قبل نباید روی صفحه‌ی جدید باقی بماند
+    closeSheet();
+    exitSelectMode();
+    if (listObserver) { listObserver.disconnect(); listObserver = null; }
     await refreshLookups();
+    if (seq !== routeSeq) return; // یک ناوبری جدیدتر شروع شده
 
     let match = null, param = null;
     if (hash.startsWith('/transactions/new')) { match = renderTxForm; param = null; }
@@ -168,9 +207,8 @@ const App = (() => {
     else if (routes[hash]) { match = routes[hash]; }
     else { match = renderDashboard; }
 
-    STATE.selectMode = false;
-    STATE.selectedIds.clear();
     await match(param);
+    if (seq !== routeSeq) return;
     renderNav(hash);
     window.scrollTo(0, 0);
   }
@@ -188,12 +226,11 @@ const App = (() => {
       nav = document.createElement('nav');
       nav.className = 'bottom-nav';
       nav.id = 'bottom-nav';
+      nav.innerHTML = items.map((it) => `<a href="${it.href}">${it.icon}<span>${it.label}</span></a>`).join('');
       root.appendChild(nav);
     }
-    nav.innerHTML = items.map((it) => {
-      const active = ('#' + hash).startsWith(it.href) || (hash === '/dashboard' && it.href === '#/dashboard');
-      return `<a href="${it.href}" class="${active ? 'active' : ''}">${it.icon}<span>${it.label}</span></a>`;
-    }).join('');
+    // فقط کلاس active جابه‌جا می‌شود؛ نوار ناوبری در هر ناوبری از نو ساخته نمی‌شود
+    nav.querySelectorAll('a').forEach((a) => a.classList.toggle('active', ('#' + hash).startsWith(a.getAttribute('href'))));
 
     let fab = document.getElementById('fab-add');
     const showFab = ['/dashboard', '/inbox', '/transactions'].some((p) => ('/' + hash.split('/')[1]) === p || hash === p);
@@ -234,11 +271,41 @@ const App = (() => {
   /* ================= داشبورد ================= */
   async function renderDashboard() {
     const all = await DB.getAll('transactions');
-    const filtered = all.filter((t) => inPeriod(t, STATE.period));
-    const deposit = filtered.filter((t) => t.type === 'deposit').reduce((s, t) => s + (t.amount || 0), 0);
-    const withdraw = filtered.filter((t) => t.type === 'withdraw').reduce((s, t) => s + (t.amount || 0), 0);
-    const lastBalance = [...all].reverse().find((t) => t.balanceAfter)?.balanceAfter;
-    const newCount = all.filter((t) => t.status === 'new').length;
+
+    // ۷ روز اخیر برای نمودار خطی: کلید هر روز = تاریخ محلی (YYYY-M-D)
+    const dayKey = (d) => `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+    const days = [];
+    const dayIndex = new Map();
+    for (let i = 0; i < 7; i++) {
+      const d = new Date(); d.setDate(d.getDate() - (6 - i));
+      dayIndex.set(dayKey(d), i);
+      days.push({ label: d.toLocaleDateString('fa-IR', { weekday: 'short' }), deposit: 0, withdraw: 0 });
+    }
+    const chartFrom = new Date(); chartFrom.setHours(0, 0, 0, 0); chartFrom.setDate(chartFrom.getDate() - 6);
+    const chartFromIso = chartFrom.toISOString();
+
+    // همه‌ی آمار داشبورد در «یک» پیمایش روی تراکنش‌ها (به‌جای ده‌ها filter/reduce جدا)
+    const fromIso = periodFromIso(STATE.period);
+    let deposit = 0, withdraw = 0, periodCount = 0, newCount = 0;
+    const byCat = new Map();
+    for (const t of all) {
+      if (t.status === 'new') newCount++;
+      const amt = t.amount || 0;
+      if (t.createdAt >= chartFromIso) {
+        const idx = dayIndex.get(dayKey(new Date(t.createdAt)));
+        if (idx !== undefined) {
+          if (t.type === 'deposit') days[idx].deposit += amt;
+          else if (t.type === 'withdraw') days[idx].withdraw += amt;
+        }
+      }
+      if (fromIso && !(t.createdAt >= fromIso)) continue;
+      periodCount++;
+      if (t.type === 'deposit') deposit += amt;
+      else if (t.type === 'withdraw') withdraw += amt;
+      if (t.categoryId) byCat.set(t.categoryId, (byCat.get(t.categoryId) || 0) + amt);
+    }
+    let lastBalance = null;
+    for (let i = all.length - 1; i >= 0; i--) { if (all[i].balanceAfter) { lastBalance = all[i].balanceAfter; break; } }
 
     const accounts = STATE.accountsCache;
     const hasAccounts = accounts.length > 0;
@@ -248,35 +315,17 @@ const App = (() => {
 
     const periods = [['today', 'امروز'], ['week', 'این هفته'], ['month', 'این ماه'], ['year', 'امسال'], ['all', 'کل بازه']];
 
-    // داده روند ۷ روز اخیر برای نمودار خطی
-    const days = [...Array(7)].map((_, i) => {
-      const d = new Date(); d.setDate(d.getDate() - (6 - i));
-      const key = d.toDateString();
-      const dayTx = all.filter((t) => new Date(t.createdAt).toDateString() === key);
-      return {
-        label: d.toLocaleDateString('fa-IR', { weekday: 'short' }),
-        deposit: dayTx.filter((t) => t.type === 'deposit').reduce((s, t) => s + (t.amount || 0), 0),
-        withdraw: dayTx.filter((t) => t.type === 'withdraw').reduce((s, t) => s + (t.amount || 0), 0),
-      };
-    });
-
-    // بر اساس دسته‌بندی
-    const byCat = {};
-    filtered.forEach((t) => {
-      if (!t.categoryId) return;
-      byCat[t.categoryId] = (byCat[t.categoryId] || 0) + (t.amount || 0);
-    });
-    const catSlices = Object.entries(byCat).map(([id, value]) => ({
-      label: catName(Number(id)) || 'سایر', value, color: catColor(Number(id)),
+    const catSlices = [...byCat].map(([id, value]) => ({
+      label: catName(id) || 'سایر', value, color: catColor(id),
     })).sort((a, b) => b.value - a.value).slice(0, 6);
 
-    const recent = [...all].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)).slice(0, 5);
+    const recent = all.sort(byNewest).slice(0, 5);
 
     mountPage(`
       ${topbar('داشبورد', { subtitle: `${APP_NAME} · کاملاً آفلاین` })}
       <div class="balance-hero">
         <div class="label">${heroLabel}</div>
-        <div class="amount">${heroBalance ? toFa(toman(heroBalance)) : '—'} <small>تومان</small></div>
+        <div class="amount">${heroBalance != null ? toFa(toman(heroBalance)) : '—'} <small>تومان</small></div>
         <div class="row">
           <div class="stat deposit"><div class="k">واریز (${periods.find((p) => p[0] === STATE.period)[1]})</div><div class="v">${toFa(toman(deposit))}</div></div>
           <div class="stat withdraw"><div class="k">برداشت (${periods.find((p) => p[0] === STATE.period)[1]})</div><div class="v">${toFa(toman(withdraw))}</div></div>
@@ -288,7 +337,7 @@ const App = (() => {
       </div>
 
       <div class="stat-grid">
-        <div class="stat-card"><div class="k">تعداد تراکنش‌ها</div><div class="v">${toFa(filtered.length)}</div></div>
+        <div class="stat-card"><div class="k">تعداد تراکنش‌ها</div><div class="v">${toFa(periodCount)}</div></div>
         <div class="stat-card"><div class="k">در انتظار بررسی</div><div class="v">${toFa(newCount)}</div></div>
       </div>
 
@@ -330,7 +379,7 @@ const App = (() => {
     document.getElementById('go-tx').onclick = () => location.hash = '#/transactions';
     document.getElementById('go-banks').onclick = () => location.hash = '#/banks';
     document.querySelectorAll('[data-account-nav]').forEach((el) => el.onclick = () => location.hash = '#/banks');
-    bindTxItemClicks();
+    STATE.itemClick = 'detail';
   }
 
   function emptyInlineHtml(title, desc) {
@@ -340,39 +389,110 @@ const App = (() => {
   function txItemHtml(t) {
     const isDeposit = t.type === 'deposit';
     const bankInitial = (t.bankName || '؟').replace('بانک ', '').slice(0, 1);
+    const cat = catName(t.categoryId);
+    const unit = unitName(t.unitId);
+    const selected = STATE.selectMode && STATE.selectedIds.has(t.id);
     return `
-      <div class="tx-item" data-id="${t.id}">
-        <div class="avatar ${isDeposit ? 'deposit' : t.type === 'withdraw' ? 'withdraw' : ''}">${bankInitial}</div>
+      <div class="tx-item${STATE.selectMode ? ' selectable' : ''}${selected ? ' checked' : ''}" data-tx-id="${t.id}">
+        <div class="avatar ${isDeposit ? 'deposit' : t.type === 'withdraw' ? 'withdraw' : ''}">${escapeHtml(bankInitial)}</div>
         <div class="info">
           <div class="top">
             <span class="bank">${escapeHtml(t.bankName || 'نامشخص')}</span>
             <span class="amount ${isDeposit ? 'deposit' : 'withdraw'}">${isDeposit ? '+' : '−'}${toFa(toman(t.amount))} <small style="font-size:10px;">تومان</small></span>
           </div>
           <div class="meta">
-            <span>${t.date || new Date(t.createdAt).toLocaleDateString('fa-IR')}</span>
+            <span>${escapeHtml(t.date || new Date(t.createdAt).toLocaleDateString('fa-IR'))}</span>
             ${t.status === 'new' ? '<span class="chip chip--new">جدید</span>' : ''}
-            ${catName(t.categoryId) ? `<span class="chip chip--muted">${escapeHtml(catName(t.categoryId))}</span>` : ''}
-            ${unitName(t.unitId) ? `<span class="chip chip--muted">${escapeHtml(unitName(t.unitId))}</span>` : ''}
+            ${cat ? `<span class="chip chip--muted">${escapeHtml(cat)}</span>` : ''}
+            ${unit ? `<span class="chip chip--muted">${escapeHtml(unit)}</span>` : ''}
           </div>
         </div>
       </div>`;
   }
 
-  function bindTxItemClicks() {
-    document.querySelectorAll('.tx-item[data-id]').forEach((el) => {
-      el.addEventListener('click', () => {
-        if (STATE.selectMode) { toggleSelect(el, Number(el.dataset.id)); return; }
-        location.hash = `#/transactions/${el.dataset.id}`;
-      });
-      let pressTimer;
-      el.addEventListener('touchstart', () => { pressTimer = setTimeout(() => enterSelectMode(el, Number(el.dataset.id)), 480); });
-      el.addEventListener('touchend', () => clearTimeout(pressTimer));
+  /* ---------- رندر تدریجی لیست‌های بلند ----------
+     به‌جای ساختن DOM همه‌ی تراکنش‌ها یک‌جا (که با چند هزار تراکنش صفحه را قفل می‌کند)،
+     هر بار LIST_CHUNK آیتم اضافه می‌شود و با نزدیک شدن اسکرول به انتهای لیست، دسته‌ی بعدی. */
+  const LIST_CHUNK = 50;
+  let listObserver = null;
+  function renderTxList(container, items, emptyHtml) {
+    if (listObserver) { listObserver.disconnect(); listObserver = null; }
+    if (!items.length) { container.innerHTML = emptyHtml; return; }
+    let shown = 0;
+    container.innerHTML = '';
+    const appendChunk = () => {
+      container.querySelector('.list-sentinel')?.remove();
+      const next = items.slice(shown, shown + LIST_CHUNK);
+      shown += next.length;
+      container.insertAdjacentHTML('beforeend', next.map(txItemHtml).join(''));
+      if (shown >= items.length) return;
+      if (!('IntersectionObserver' in window)) { appendChunk(); return; }
+      const sentinel = document.createElement('div');
+      sentinel.className = 'list-sentinel';
+      container.appendChild(sentinel);
+      if (!listObserver) {
+        listObserver = new IntersectionObserver((entries) => {
+          if (entries.some((e) => e.isIntersecting)) appendChunk();
+        }, { rootMargin: '600px 0px' });
+      }
+      listObserver.observe(sentinel);
+    };
+    appendChunk();
+  }
+
+  /* ---------- مدیریت کلیک/لمس طولانی با Event Delegation ----------
+     یک listener روی پوسته‌ی برنامه به‌جای چند listener برای هر آیتم در هر رندر.
+     رفتار کلیک به صفحه بستگی دارد: در کارتابل «دسته‌بندی سریع»، بقیه‌جا «جزئیات». */
+  const LONG_PRESS_MS = 480;
+  function setupListInteractions() {
+    let pressTimer = null, startX = 0, startY = 0, suppressClick = false;
+    const cancelPress = () => { clearTimeout(pressTimer); pressTimer = null; };
+
+    root.addEventListener('touchstart', (e) => {
+      const el = e.target.closest('.tx-item[data-tx-id]');
+      suppressClick = false;
+      if (!el || e.touches.length !== 1) return;
+      startX = e.touches[0].clientX; startY = e.touches[0].clientY;
+      cancelPress();
+      pressTimer = setTimeout(() => {
+        pressTimer = null;
+        // کلیکی که بعد از رها کردن انگشت می‌آید نباید انتخاب را بلافاصله برگرداند
+        suppressClick = true;
+        if (STATE.selectMode) toggleSelect(el, Number(el.dataset.txId));
+        else enterSelectMode(el, Number(el.dataset.txId));
+        try { navigator.vibrate?.(15); } catch (_) {}
+      }, LONG_PRESS_MS);
+    }, { passive: true });
+    root.addEventListener('touchmove', (e) => {
+      if (!pressTimer) return;
+      const t = e.touches[0];
+      if (Math.abs(t.clientX - startX) > 10 || Math.abs(t.clientY - startY) > 10) cancelPress();
+    }, { passive: true });
+    root.addEventListener('touchend', cancelPress, { passive: true });
+    root.addEventListener('touchcancel', cancelPress, { passive: true });
+    root.addEventListener('contextmenu', (e) => { if (e.target.closest('.tx-item[data-tx-id]')) e.preventDefault(); });
+
+    root.addEventListener('click', (e) => {
+      const el = e.target.closest('.tx-item[data-tx-id]');
+      if (!el) return;
+      if (suppressClick) { suppressClick = false; return; }
+      const id = Number(el.dataset.txId);
+      if (STATE.selectMode) { toggleSelect(el, id); return; }
+      if (STATE.itemClick === 'inbox') quickCategorizeSheet(id);
+      else location.hash = `#/transactions/${id}`;
     });
+  }
+
+  function exitSelectMode() {
+    STATE.selectMode = false;
+    STATE.selectedIds.clear();
+    document.querySelectorAll('.tx-item.selectable, .tx-item.checked').forEach((e) => e.classList.remove('selectable', 'checked'));
+    document.getElementById('bulk-bar')?.remove();
   }
 
   function enterSelectMode(el, id) {
     STATE.selectMode = true;
-    document.querySelectorAll('.tx-item').forEach((e) => e.classList.add('selectable'));
+    document.querySelectorAll('.tx-item[data-tx-id]').forEach((e) => e.classList.add('selectable'));
     toggleSelect(el, id);
     showBulkBar();
   }
@@ -380,8 +500,8 @@ const App = (() => {
   function toggleSelect(el, id) {
     if (STATE.selectedIds.has(id)) { STATE.selectedIds.delete(id); el.classList.remove('checked'); }
     else { STATE.selectedIds.add(id); el.classList.add('checked'); }
-    if (STATE.selectedIds.size === 0) { STATE.selectMode = false; document.querySelectorAll('.tx-item').forEach((e) => e.classList.remove('selectable')); document.getElementById('bulk-bar')?.remove(); }
-    else { updateBulkBar(); }
+    if (STATE.selectedIds.size === 0) exitSelectMode();
+    else updateBulkBar();
   }
 
   function showBulkBar() {
@@ -403,13 +523,13 @@ const App = (() => {
       </div>
     </div>`;
     document.body.appendChild(bar);
-    document.getElementById('bulk-cancel').onclick = () => { STATE.selectMode = false; STATE.selectedIds.clear(); document.querySelectorAll('.tx-item').forEach((e) => { e.classList.remove('selectable', 'checked'); }); bar.remove(); };
+    document.getElementById('bulk-cancel').onclick = exitSelectMode;
     document.getElementById('bulk-delete').onclick = async () => {
-      const ok = await confirmDialog(`${STATE.selectedIds.size} تراکنش حذف شود؟ این عملیات قابل بازگشت نیست.`);
+      const ok = await confirmDialog(`${toFa(STATE.selectedIds.size)} تراکنش حذف شود؟ این عملیات قابل بازگشت نیست.`);
       if (!ok) return;
-      for (const id of STATE.selectedIds) await DB.del('transactions', id);
+      await DB.bulkDelete('transactions', [...STATE.selectedIds]);
       toast('تراکنش‌های انتخاب‌شده حذف شدند');
-      STATE.selectMode = false; STATE.selectedIds.clear(); bar.remove();
+      exitSelectMode();
       router();
     };
     document.getElementById('bulk-edit').onclick = () => openBulkEditSheet();
@@ -432,47 +552,31 @@ const App = (() => {
       <button class="btn btn-primary" id="be-apply">اعمال روی موارد انتخاب‌شده</button>
     `);
     sheet.querySelector('#be-apply').onclick = async () => {
-      const unitId = sheet.querySelector('#be-unit').value;
-      const categoryId = sheet.querySelector('#be-cat').value;
-      for (const id of STATE.selectedIds) {
-        const t = await DB.get('transactions', id);
-        if (unitId) t.unitId = Number(unitId);
-        if (categoryId) t.categoryId = Number(categoryId);
+      const unitId = Number(sheet.querySelector('#be-unit').value) || null;
+      const categoryId = Number(sheet.querySelector('#be-cat').value) || null;
+      await DB.bulkUpdate('transactions', [...STATE.selectedIds], (t) => {
+        if (unitId) t.unitId = unitId;
+        if (categoryId) t.categoryId = categoryId;
         if (t.status === 'new') t.status = 'reviewed';
-        await DB.put('transactions', t);
-      }
+      });
       toast('تغییرات اعمال شد');
       closeSheet();
-      document.getElementById('bulk-bar')?.remove();
-      STATE.selectMode = false; STATE.selectedIds.clear();
+      exitSelectMode();
       router();
     };
   }
 
   /* ================= کارتابل ================= */
   async function renderInbox() {
-    const all = await DB.getAll('transactions', 'by_status', 'new');
-    const sorted = all.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    const all = await DB.getAll('transactions');
+    const sorted = all.filter((t) => t.status === 'new').sort(byNewest);
     mountPage(`
       ${topbar('کارتابل', { subtitle: `${toFa(sorted.length)} تراکنش در انتظار بررسی` })}
       ${sorted.length ? `<div class="inbox-banner">${ICON.sms} این تراکنش‌ها از پیامک‌های بانکی استخراج شده‌اند. با ضربه روی هرکدام، دسته‌بندی را مشخص کنید.</div>` : ''}
-      <div class="tx-list">
-        ${sorted.length ? sorted.map(txItemHtml).join('') : emptyInlineHtml('کارتابل خالی است', 'وقتی پیامک بانکی جدیدی دریافت یا ثبت شود، اینجا نمایش داده می‌شود.')}
-      </div>
+      <div class="tx-list" id="inbox-list"></div>
     `);
-    bindInboxItemClicks();
-  }
-
-  function bindInboxItemClicks() {
-    document.querySelectorAll('.tx-item[data-id]').forEach((el) => {
-      el.addEventListener('click', () => {
-        if (STATE.selectMode) { toggleSelect(el, Number(el.dataset.id)); return; }
-        quickCategorizeSheet(Number(el.dataset.id));
-      });
-      let pressTimer;
-      el.addEventListener('touchstart', () => { pressTimer = setTimeout(() => enterSelectMode(el, Number(el.dataset.id)), 480); });
-      el.addEventListener('touchend', () => clearTimeout(pressTimer));
-    });
+    STATE.itemClick = 'inbox';
+    renderTxList(document.getElementById('inbox-list'), sorted, emptyInlineHtml('کارتابل خالی است', 'وقتی پیامک بانکی جدیدی دریافت یا ثبت شود، اینجا نمایش داده می‌شود.'));
   }
 
   /* شیت «دسته‌بندی سریع» — سریع‌ترین مسیر برای مشخص‌کردن واحد/دسته‌بندی یک تراکنش
@@ -557,7 +661,7 @@ const App = (() => {
           const name = sheet.querySelector('#qc-new-unit-name').value.trim();
           if (!name) return;
           const newId = await DB.add('units', { name, color: PALETTE[STATE.unitsCache.length % PALETTE.length] });
-          STATE.unitsCache = await DB.getAll('units');
+          await refreshLookups();
           selUnit = newId;
           sheet.querySelector('#qc-units').innerHTML = unitsChipsHtml();
           sheet.querySelector('#qc-unit-add-box').innerHTML = '';
@@ -577,7 +681,7 @@ const App = (() => {
           const name = sheet.querySelector('#qc-new-cat-name').value.trim();
           if (!name) return;
           const newId = await DB.add('categories', { name, color: PALETTE[(STATE.categoriesCache.length + 1) % PALETTE.length], unitId: null });
-          STATE.categoriesCache = await DB.getAll('categories');
+          await refreshLookups();
           selCat = newId;
           sheet.querySelector('#qc-cats').innerHTML = catsChipsHtml();
           sheet.querySelector('#qc-cat-add-box').innerHTML = '';
@@ -603,38 +707,56 @@ const App = (() => {
       location.hash = `#/transactions/${t.id}`;
     };
   }
-  async function renderTransactions() {
-    let all = await DB.getAll('transactions');
-    all.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  // متن قابل‌جستجوی هر تراکنش یک‌بار ساخته و کش می‌شود (کلید: خودِ شیء از کش DB)
+  const searchHayMemo = new WeakMap();
+  function searchHay(t) {
+    let h = searchHayMemo.get(t);
+    if (h === undefined) {
+      h = SmsParser.toLatinDigits([t.bankName, t.rawText, t.description, t.cardNumber, t.accountNumber, t.trackingCode, String(t.amount ?? ''), String(toman(t.amount) || ''), (t.tags || []).join(' ')].join(' ')).toLowerCase();
+      searchHayMemo.set(t, h);
+    }
+    return h;
+  }
 
+  async function renderTransactions() {
+    const all = (await DB.getAll('transactions')).sort(byNewest);
     const f = STATE.txFilter;
-    let filtered = all.filter((t) => {
-      if (f.status && t.status !== f.status) return false;
-      if (f.unitId && t.unitId !== f.unitId) return false;
-      if (f.categoryId && t.categoryId !== f.categoryId) return false;
-      if (f.q) {
-        const q = f.q.toLowerCase();
-        const hay = [t.bankName, t.rawText, t.description, t.cardNumber, t.accountNumber, String(t.amount)].join(' ').toLowerCase();
-        if (!hay.includes(q)) return false;
-      }
-      return true;
-    });
 
     mountPage(`
-      ${topbar('تراکنش‌ها', { subtitle: `${toFa(filtered.length)} مورد` })}
-      <input class="search-input" id="tx-search" placeholder="جستجو در مبلغ، بانک، شماره کارت، توضیحات..." value="${escapeHtml(f.q)}" />
+      ${topbar('تراکنش‌ها', { subtitle: '<span id="tx-count"></span>' })}
+      <input class="search-input" id="tx-search" type="search" placeholder="جستجو در مبلغ، بانک، شماره کارت، توضیحات..." value="${escapeHtml(f.q)}" />
       <div class="filter-bar mt-16">
         <button class="icon-btn" id="btn-filter">${ICON.filter}</button>
         ${f.status ? `<span class="chip chip--muted">وضعیت: ${f.status === 'new' ? 'جدید' : 'بررسی‌شده'}</span>` : ''}
         ${f.unitId ? `<span class="chip chip--muted">${escapeHtml(unitName(f.unitId) || '')}</span>` : ''}
         ${f.categoryId ? `<span class="chip chip--muted">${escapeHtml(catName(f.categoryId) || '')}</span>` : ''}
       </div>
-      <div class="tx-list mt-16">
-        ${filtered.length ? filtered.map(txItemHtml).join('') : emptyInlineHtml('چیزی پیدا نشد', 'فیلتر یا عبارت جستجو را تغییر دهید.')}
-      </div>
+      <div class="tx-list mt-16" id="tx-list"></div>
     `);
-    bindTxItemClicks();
-    document.getElementById('tx-search').oninput = (e) => { STATE.txFilter.q = e.target.value; renderTransactions(); };
+    STATE.itemClick = 'detail';
+
+    // فقط لیست و شمارنده دوباره رندر می‌شوند؛ کادر جستجو دست‌نخورده می‌ماند تا
+    // فوکوس و کیبورد هنگام تایپ از دست نرود (در نسخه‌ی قبلی کل صفحه با هر حرف بازسازی می‌شد).
+    const applyFilter = () => {
+      const q = SmsParser.toLatinDigits(f.q.trim()).toLowerCase();
+      const filtered = all.filter((t) => {
+        if (f.status && t.status !== f.status) return false;
+        if (f.unitId && t.unitId !== f.unitId) return false;
+        if (f.categoryId && t.categoryId !== f.categoryId) return false;
+        if (q && !searchHay(t).includes(q)) return false;
+        return true;
+      });
+      document.getElementById('tx-count').textContent = `${toFa(filtered.length)} مورد`;
+      renderTxList(document.getElementById('tx-list'), filtered, emptyInlineHtml('چیزی پیدا نشد', 'فیلتر یا عبارت جستجو را تغییر دهید.'));
+    };
+    applyFilter();
+
+    let debounce;
+    document.getElementById('tx-search').oninput = (e) => {
+      STATE.txFilter.q = e.target.value;
+      clearTimeout(debounce);
+      debounce = setTimeout(applyFilter, 150);
+    };
     document.getElementById('btn-filter').onclick = () => openTxFilterSheet();
   }
 
@@ -871,17 +993,19 @@ const App = (() => {
     let err = input.closest('.field').querySelector('.field-error');
     if (!err) { err = document.createElement('div'); err.className = 'field-error'; input.closest('.field').appendChild(err); }
     err.textContent = msg;
+    input.addEventListener('input', () => { input.closest('.field').classList.remove('has-error'); err.remove(); }, { once: true });
     input.focus();
   }
 
   /* ================= گزارش‌ها ================= */
   async function renderReports() {
-    const all = await DB.getAll('transactions');
+    const all = (await DB.getAll('transactions')).sort(byNewest);
+    const bankNames = [...new Set(all.map((t) => t.bankName).filter(Boolean))];
     mountPage(`
       ${topbar('گزارش‌ها', { subtitle: 'فیلتر کنید و خروجی بگیرید' })}
       <div class="card">
         <div class="field"><label>بانک</label>
-          <select id="r-bank"><option value="">همه بانک‌ها</option>${[...new Set(all.map((t) => t.bankName))].map((b) => `<option value="${escapeHtml(b)}">${escapeHtml(b)}</option>`).join('')}</select>
+          <select id="r-bank"><option value="">همه بانک‌ها</option>${bankNames.map((b) => `<option value="${escapeHtml(b)}">${escapeHtml(b)}</option>`).join('')}</select>
         </div>
         <div class="field"><label>واحد</label>
           <select id="r-unit"><option value="">همه واحدها</option>${STATE.unitsCache.map((u) => `<option value="${u.id}">${escapeHtml(u.name)}</option>`).join('')}</select>
@@ -898,27 +1022,25 @@ const App = (() => {
 
       <div id="r-results" class="mt-24"></div>
     `);
+    STATE.itemClick = 'detail';
 
-    document.getElementById('r-run').onclick = async () => {
+    document.getElementById('r-run').onclick = () => {
       const bank = document.getElementById('r-bank').value;
       const unitId = Number(document.getElementById('r-unit').value) || null;
       const categoryId = Number(document.getElementById('r-cat').value) || null;
       const type = document.getElementById('r-type').value;
-      const q = document.getElementById('r-q').value.toLowerCase();
+      const q = SmsParser.toLatinDigits(document.getElementById('r-q').value.trim()).toLowerCase();
 
       const results = all.filter((t) => {
         if (bank && t.bankName !== bank) return false;
         if (unitId && t.unitId !== unitId) return false;
         if (categoryId && t.categoryId !== categoryId) return false;
         if (type && t.type !== type) return false;
-        if (q) {
-          const hay = [t.bankName, t.rawText, t.description].join(' ').toLowerCase();
-          if (!hay.includes(q)) return false;
-        }
+        if (q && !searchHay(t).includes(q)) return false;
         return true;
       });
 
-      const sum = results.reduce((s, t) => s + (t.type === 'deposit' ? t.amount : -t.amount), 0);
+      const sum = results.reduce((s, t) => s + signedAmount(t), 0);
       const box = document.getElementById('r-results');
       box.innerHTML = `
         <div class="section-title"><h2>${toFa(results.length)} نتیجه — تراز: ${toFa(toman(sum))} تومان</h2></div>
@@ -928,9 +1050,9 @@ const App = (() => {
           <button class="btn btn-ghost" id="exp-json">${ICON.export} JSON</button>
         </div>
         <button class="btn btn-ghost mt-8" id="exp-print" style="margin-bottom:14px;">${ICON.export} چاپ / PDF</button>
-        <div class="tx-list">${results.map(txItemHtml).join('') || emptyInlineHtml('نتیجه‌ای یافت نشد', 'فیلترها را تغییر دهید.')}</div>
+        <div class="tx-list" id="r-list"></div>
       `;
-      bindTxItemClicks();
+      renderTxList(document.getElementById('r-list'), results, emptyInlineHtml('نتیجه‌ای یافت نشد', 'فیلترها را تغییر دهید.'));
       document.getElementById('exp-xlsx').onclick = () => exportXlsx(results);
       document.getElementById('exp-csv').onclick = () => exportCsv(results);
       document.getElementById('exp-json').onclick = () => exportJson(results);
@@ -939,39 +1061,43 @@ const App = (() => {
   }
 
   function downloadBlob(content, filename, type) {
-    const blob = new Blob([content], { type });
+    const blob = content instanceof Blob ? content : new Blob([content], { type });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url; a.download = filename;
     document.body.appendChild(a); a.click(); a.remove();
-    URL.revokeObjectURL(url);
+    // آزادسازی با تأخیر: در برخی WebView ها revoke فوری باعث شکست دانلود می‌شود
+    setTimeout(() => URL.revokeObjectURL(url), 1500);
   }
+
+  const typeLabel = (t) => (t.type === 'deposit' ? 'واریز' : t.type === 'withdraw' ? 'برداشت' : 'نامشخص');
+  const REPORT_HEADERS = ['بانک', 'نوع', 'مبلغ (تومان)', 'تاریخ', 'ساعت', 'واحد', 'دسته‌بندی', 'توضیحات', 'شماره پیگیری'];
 
   // ستون‌های مشترک بین خروجی CSV و Excel، برای جلوگیری از ناهم‌خوانی بین دو فرمت
   function reportRows(rows) {
     return rows.map((t) => [
-      t.bankName || '', t.type === 'deposit' ? 'واریز' : t.type === 'withdraw' ? 'برداشت' : 'نامشخص',
+      t.bankName || '', typeLabel(t),
       toman(t.amount) || 0, t.date || '', t.time || '',
       unitName(t.unitId) || '', catName(t.categoryId) || '', t.description || '', t.trackingCode || '',
     ]);
   }
 
   function exportXlsx(rows) {
-    const headers = ['بانک', 'نوع', 'مبلغ (تومان)', 'تاریخ', 'ساعت', 'واحد', 'دسته‌بندی', 'توضیحات', 'شماره پیگیری'];
-    XlsxExport.download(headers, reportRows(rows), 'گزارش-تراکنش‌ها.xlsx', 'گزارش تراکنش‌ها');
+    XlsxExport.download(REPORT_HEADERS, reportRows(rows), 'گزارش-تراکنش‌ها.xlsx', 'گزارش تراکنش‌ها');
     toast('فایل Excel دانلود شد');
   }
 
+  // جلوگیری از CSV/Formula Injection: سلول‌های متنی که با = + - @ شروع می‌شوند در اکسل فرمول تلقی می‌شوند
+  const csvCell = (v) => {
+    let s = String(v ?? '');
+    if (typeof v !== 'number' && /^[=+\-@\t\r]/.test(s)) s = "'" + s;
+    return `"${s.replace(/"/g, '""')}"`;
+  };
+
   function exportCsv(rows) {
-    const headers = ['بانک', 'نوع', 'مبلغ (تومان)', 'تاریخ', 'ساعت', 'واحد', 'دسته‌بندی', 'توضیحات', 'شماره پیگیری'];
-    const lines = [headers.join(',')];
-    rows.forEach((t) => {
-      lines.push([
-        t.bankName, t.type === 'deposit' ? 'واریز' : 'برداشت', toman(t.amount), t.date || '', t.time || '',
-        unitName(t.unitId) || '', catName(t.categoryId) || '', (t.description || '').replace(/,/g, ' '), t.trackingCode || '',
-      ].map((v) => `"${String(v).replace(/"/g, '""')}"`).join(','));
-    });
-    downloadBlob('\uFEFF' + lines.join('\n'), 'گزارش-تراکنش‌ها.csv', 'text/csv;charset=utf-8');
+    const lines = [REPORT_HEADERS.map(csvCell).join(',')];
+    for (const r of reportRows(rows)) lines.push(r.map(csvCell).join(','));
+    downloadBlob('﻿' + lines.join('\r\n'), 'گزارش-تراکنش‌ها.csv', 'text/csv;charset=utf-8');
     toast('فایل CSV دانلود شد');
   }
 
@@ -982,14 +1108,15 @@ const App = (() => {
 
   function printReport(rows, sum) {
     const w = window.open('', '_blank');
+    if (!w) return toast('باز کردن پنجره‌ی چاپ ممکن نشد');
     w.document.write(`
       <html dir="rtl"><head><meta charset="utf-8"><title>گزارش تراکنش‌ها</title>
       <style>body{font-family:Tahoma,sans-serif;padding:20px} table{width:100%;border-collapse:collapse} td,th{border:1px solid #ccc;padding:6px;font-size:12px} th{background:#eee}</style>
       </head><body>
       <h2>گزارش تراکنش‌ها</h2>
-      <p>تعداد: ${rows.length} — تراز: ${toman(sum).toLocaleString('fa-IR')} تومان</p>
+      <p>تعداد: ${toFa(rows.length)} — تراز: ${toFa(toman(sum))} تومان</p>
       <table><tr><th>بانک</th><th>نوع</th><th>مبلغ (تومان)</th><th>تاریخ</th><th>واحد</th><th>دسته‌بندی</th></tr>
-      ${rows.map((t) => `<tr><td>${t.bankName}</td><td>${t.type === 'deposit' ? 'واریز' : 'برداشت'}</td><td>${toman(t.amount).toLocaleString('fa-IR')}</td><td>${t.date || ''}</td><td>${unitName(t.unitId) || ''}</td><td>${catName(t.categoryId) || ''}</td></tr>`).join('')}
+      ${rows.map((t) => `<tr><td>${escapeHtml(t.bankName)}</td><td>${typeLabel(t)}</td><td>${toFa(toman(t.amount))}</td><td>${escapeHtml(t.date || '')}</td><td>${escapeHtml(unitName(t.unitId) || '')}</td><td>${escapeHtml(catName(t.categoryId) || '')}</td></tr>`).join('')}
       </table></body></html>
     `);
     w.document.close(); w.print();
@@ -1336,7 +1463,7 @@ const App = (() => {
     document.getElementById('sw-notif').onchange = (e) => DB.put('settings', { key: 'notifEnabled', value: e.target.checked });
     document.getElementById('sw-theme').onchange = (e) => {
       const t = e.target.checked ? 'dark' : 'light';
-      document.documentElement.dataset.theme = t;
+      applyTheme(t);
       DB.put('settings', { key: 'theme', value: t });
     };
     document.getElementById('btn-pin').onclick = () => pinSetupSheet(pinSet);
@@ -1359,6 +1486,9 @@ const App = (() => {
       const ok = await confirmDialog('همه داده‌ها (تراکنش‌ها، واحدها، دسته‌بندی‌ها) برای همیشه پاک شوند؟');
       if (!ok) return;
       await DB.wipeAll();
+      // جلوگیری از بازگشت داده‌های نمونه در اجرای بعدی، و رد شدن از صفحه‌ی خوش‌آمد
+      await DB.put('settings', { key: 'seeded', value: true });
+      await DB.put('settings', { key: 'onboarded', value: true });
       toast('داده‌ها پاک شدند');
       location.hash = '#/dashboard';
       router();
@@ -1521,8 +1651,9 @@ const App = (() => {
   /* ---------------- شروع برنامه ---------------- */
   async function init() {
     const savedTheme = (await DB.get('settings', 'theme'))?.value;
-    if (savedTheme) document.documentElement.dataset.theme = savedTheme;
+    if (savedTheme) applyTheme(savedTheme);
     await Seed.run();
+    setupListInteractions();
     window.addEventListener('hashchange', router);
     await router();
     connectNativeSmsIfAvailable();

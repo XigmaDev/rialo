@@ -39,8 +39,10 @@ const Seed = (() => {
   ];
 
   async function run() {
+    // فقط بار اول: پرچم seeded باعث می‌شود بعد از «پاک‌سازی کامل»، داده‌ی نمونه دوباره برنگردد
+    if ((await DB.get('settings', 'seeded'))?.value) return;
     const existingUnits = await DB.getAll('units');
-    if (existingUnits.length > 0) return; // فقط بار اول
+    if (existingUnits.length > 0) { await DB.put('settings', { key: 'seeded', value: true }); return; }
 
     const unitIds = {};
     for (const u of SAMPLE_UNITS) {
@@ -106,6 +108,7 @@ const Seed = (() => {
       tags: ['قبض', 'خانه'],
       createdAt: new Date().toISOString(),
     });
+    await DB.put('settings', { key: 'seeded', value: true });
   }
 
   return { run };

@@ -32,7 +32,8 @@ const XlsxExport = (() => {
   function strToBytes(str) { return new TextEncoder().encode(str); }
 
   function escapeXml(s) {
-    return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' }[c]));
+    // کاراکترهای کنترلی غیرمجاز در XML 1.0 (گاهی در متن پیامک‌ها هست) فایل را از نظر Excel «خراب» می‌کنند
+    return String(s ?? '').replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' }[c]));
   }
 
   function u16(n) { return new Uint8Array([n & 0xFF, (n >>> 8) & 0xFF]); }
@@ -104,20 +105,23 @@ const XlsxExport = (() => {
 
   function buildSheetXml(headers, rows) {
     const allRows = [headers, ...rows];
-    let rowsXml = '';
+    const width = allRows.reduce((m, r) => Math.max(m, r.length), 0);
+    const cols = Array.from({ length: width }, (_, i) => colName(i)); // نام ستون‌ها یک‌بار محاسبه می‌شود
+    const parts = [];
     allRows.forEach((rowData, rIdx) => {
       const r = rIdx + 1;
-      let cellsXml = '';
+      parts.push(`<row r="${r}">`);
       rowData.forEach((val, cIdx) => {
-        const ref = colName(cIdx) + r;
+        const ref = cols[cIdx] + r;
         if (typeof val === 'number' && isFinite(val)) {
-          cellsXml += `<c r="${ref}"><v>${val}</v></c>`;
+          parts.push(`<c r="${ref}"><v>${val}</v></c>`);
         } else {
-          cellsXml += `<c r="${ref}" t="inlineStr"><is><t xml:space="preserve">${escapeXml(val)}</t></is></c>`;
+          parts.push(`<c r="${ref}" t="inlineStr"><is><t xml:space="preserve">${escapeXml(val)}</t></is></c>`);
         }
       });
-      rowsXml += `<row r="${r}">${cellsXml}</row>`;
+      parts.push('</row>');
     });
+    const rowsXml = parts.join('');
     return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n` +
       `<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">` +
       `<sheetViews><sheetView rightToLeft="1" workbookViewId="0"/></sheetViews>` +
@@ -176,7 +180,7 @@ const XlsxExport = (() => {
     const a = document.createElement('a');
     a.href = url; a.download = filename;
     document.body.appendChild(a); a.click(); a.remove();
-    URL.revokeObjectURL(url);
+    setTimeout(() => URL.revokeObjectURL(url), 1500);
   }
 
   return { download, buildXlsxBytes };

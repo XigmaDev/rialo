@@ -5,9 +5,11 @@
 
 const Charts = (() => {
 
-  function fmt(n) {
-    return Math.round(n).toLocaleString('fa-IR');
+  // مقادیر به ریال ذخیره می‌شوند ولی کل رابط کاربری تومان نشان می‌دهد
+  function fmt(rial) {
+    return Math.round((rial || 0) / 10).toLocaleString('fa-IR');
   }
+  const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
   // نمودار خطی روند ورود/خروج پول
   function lineChart(container, series, opts = {}) {
@@ -48,7 +50,10 @@ const Charts = (() => {
     const cx = size / 2, cy = size / 2;
     const total = slices.reduce((a, s) => a + s.value, 0) || 1;
     let angle = -Math.PI / 2;
-    const paths = slices.map((s) => {
+    // یک برش ۱۰۰٪ با کمان SVG قابل رسم نیست (نقطه‌ی شروع و پایان یکی است) — دایره‌ی کامل
+    const paths = slices.length === 1
+      ? `<circle cx="${cx}" cy="${cy}" r="${r}" fill="${esc(slices[0].color)}" opacity="0.92"><title>${esc(slices[0].label)}: ${fmt(slices[0].value)} تومان</title></circle>`
+      : slices.map((s) => {
       const frac = s.value / total;
       const start = angle;
       const end = angle + frac * Math.PI * 2;
@@ -56,7 +61,7 @@ const Charts = (() => {
       const x1 = cx + r * Math.cos(start), y1 = cy + r * Math.sin(start);
       const x2 = cx + r * Math.cos(end), y2 = cy + r * Math.sin(end);
       const large = frac > 0.5 ? 1 : 0;
-      return `<path d="M${cx},${cy} L${x1},${y1} A${r},${r} 0 ${large} 1 ${x2},${y2} Z" fill="${s.color}" opacity="0.92"><title>${s.label}: ${fmt(s.value)} ریال</title></path>`;
+      return `<path d="M${cx},${cy} L${x1},${y1} A${r},${r} 0 ${large} 1 ${x2},${y2} Z" fill="${esc(s.color)}" opacity="0.92"><title>${esc(s.label)}: ${fmt(s.value)} تومان</title></path>`;
     }).join('');
 
     container.innerHTML = `
@@ -65,7 +70,7 @@ const Charts = (() => {
         <circle cx="${cx}" cy="${cy}" r="${r * 0.55}" fill="var(--surface)" />
       </svg>
       <ul class="donut-legend">
-        ${slices.map((s) => `<li><span class="dot" style="background:${s.color}"></span>${s.label} <b>${fmt(s.value)}</b></li>`).join('')}
+        ${slices.map((s) => `<li><span class="dot" style="background:${esc(s.color)}"></span>${esc(s.label)} <b>${fmt(s.value)}</b></li>`).join('')}
       </ul>
     `;
   }

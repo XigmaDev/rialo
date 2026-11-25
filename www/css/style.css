@@ -160,13 +160,13 @@ main.page {
   background-image: var(--girih-pattern);
   background-size: 120px 120px;
   opacity: .10;
-  mix-blend-mode: screen;
+  pointer-events: none;
 }
 .balance-hero .label { font-size: 13px; opacity: .82; font-weight: 600; }
 .balance-hero .amount { font-family: var(--font-display); font-size: 32px; font-weight: 800; margin: 6px 0 14px; position: relative; }
 .balance-hero .amount small { font-size: 14px; font-weight: 600; opacity: .8; margin-inline-start: 6px; }
 .balance-hero .row { display: flex; gap: 10px; position: relative; }
-.balance-hero .stat { flex: 1; background: rgba(255,255,255,.10); border-radius: var(--radius-sm); padding: 10px 12px; backdrop-filter: blur(2px); }
+.balance-hero .stat { flex: 1; background: rgba(255,255,255,.10); border-radius: var(--radius-sm); padding: 10px 12px; }
 .balance-hero .stat .k { font-size: 11px; opacity: .78; }
 .balance-hero .stat .v { font-size: 15px; font-weight: 800; margin-top: 2px; }
 .balance-hero .stat.deposit .v { color: #9CE8C4; }
@@ -177,7 +177,7 @@ main.page {
 .period-tabs button {
   border: 1px solid var(--border); background: var(--surface); color: var(--text-muted);
   padding: 7px 14px; border-radius: 999px; font-size: 12.5px; cursor: pointer; white-space: nowrap;
-  font-weight: 600; transition: all .15s ease;
+  font-weight: 600; transition: background-color .15s ease, color .15s ease, border-color .15s ease;
 }
 .period-tabs button.active { background: var(--primary); border-color: var(--primary); color: var(--on-primary); }
 
@@ -223,7 +223,8 @@ main.page {
   display: flex; align-items: center; gap: 12px;
   background: var(--surface); border: 1px solid var(--border);
   border-radius: var(--radius-md); padding: 12px 14px;
-  cursor: pointer; transition: transform .12s ease, box-shadow .12s ease;
+  cursor: pointer; transition: transform .12s ease, border-color .12s ease, background-color .12s ease;
+  -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
 }
 .tx-item:active { transform: scale(.98); }
 .tx-item .avatar {
@@ -245,6 +246,12 @@ main.page {
 
 /* --- انتخاب چندتایی --- */
 .tx-item.selectable { position: relative; }
+.tx-item.checked {
+  border-color: var(--primary);
+  background: color-mix(in srgb, var(--primary) 10%, var(--surface));
+  box-shadow: inset 0 0 0 1px var(--primary);
+}
+.list-sentinel { height: 1px; }
 .tx-item .check {
   width: 20px; height: 20px; border-radius: 50%; border: 2px solid var(--border);
   flex-shrink: 0; display: flex; align-items: center; justify-content: center;
@@ -341,7 +348,7 @@ main.page {
 .chip-select {
   border: 1px solid var(--border); background: var(--surface-alt); color: var(--text-muted);
   padding: 8px 14px; border-radius: 999px; font-size: 12.5px; font-weight: 700; cursor: pointer;
-  font-family: inherit; transition: all .12s ease; display: inline-flex; align-items: center; gap: 4px;
+  font-family: inherit; transition: background-color .12s ease, color .12s ease, border-color .12s ease; display: inline-flex; align-items: center; gap: 4px;
 }
 .chip-select.active { background: var(--primary); color: var(--on-primary); border-color: var(--primary); }
 
